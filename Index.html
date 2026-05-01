@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Universal Media Loader</title>
+
+<!-- HLS + DASH support -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+
+<style>
+    body {
+        margin: 0;
+        background: #111;
+        color: #fff;
+        font-family: Arial, sans-serif;
+    }
+    header {
+        padding: 20px;
+        background: #222;
+        text-align: center;
+        font-size: 20px;
+        font-weight: bold;
+    }
+    #loader {
+        padding: 20px;
+        display: flex;
+        gap: 10px;
+        justify-content: center;
+        background: #181818;
+    }
+    input {
+        width: 60%;
+        padding: 10px;
+        border-radius: 6px;
+        border: none;
+        font-size: 16px;
+    }
+    button {
+        padding: 10px 20px;
+        border: none;
+        background: #0a84ff;
+        color: white;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 16px;
+    }
+    #player-container {
+        width: 100%;
+        height: calc(100vh - 120px);
+        background: black;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+    }
+    video, iframe {
+        width: 100%;
+        height: 100%;
+        border: none;
+        background: black;
+    }
+</style>
+</head>
+
+<body>
+
+<header>Universal Media Loader</header>
+
+<div id="loader">
+    <input id="urlInput" placeholder="Enter any media URL (m3u8, mp4, mpd, m3u, json, html, etc.)" />
+    <button onclick="loadMedia()">Load</button>
+</div>
+
+<div id="player-container">
+    <video id="videoPlayer" controls></video>
+</div>
+
+<script>
+async function loadMedia() {
+    const url = document.getElementById("urlInput").value.trim();
+    if (!url) return alert("Enter a URL");
+
+    const type = await detectType(url);
+    console.log("Detected type:", type);
+
+    if (type === "html") return loadHTML(url);
+    if (type === "hls") return loadHLS(url);
+    if (type === "dash") return loadDASH(url);
+    if (type === "file") return loadFile(url);
+    if (type === "iframe") return loadIframe(url);
+    if (type === "m3u") return parseM3U(url);
+    if (type === "json") return parseJSON(url);
+
+    alert("Unsupported or unknown media type");
+}
+
+/* ------------------------------
+   AUTO-DETECTION LOGIC
+--------------------------------*/
+async function detectType(url) {
+    const lower = url.toLowerCase();
+
+    if (lower.endsWith(".m3u") || lower.endsWith(".m3u8")) return "m3u";
+    if (lower.endsWith(".mpd")) return "dash";
+    if (lower.endsWith(".mp4") || lower.endsWith(".ts") || lower.endsWith(".mpeg")) return "file";
+    if (lower.endsWith(".json")) return "json";
+    if (lower.includes("embed") || lower.includes("iframe")) return "iframe";
+
+    try {
+        const res = await fetch(url, { method: "GET" });
+        const contentType = res.headers.get("content-type") || "";
+
+        if (contentType.includes("html")) return "html";
+        if (contentType.includes("mpegurl")) return "hls";
+        if (contentType.includes("dash")) return "dash";
+        if (contentType.includes("video")) return "file";
+        if (contentType.includes("json")) return "json";
+
+        const text = await res.text();
+        if (text.startsWith("#EXTM3U")) return "m3u";
+        if (text.startsWith("<MPD")) return "dash";
+
+    } catch (e) {
+        console.warn("Detection failed:", e);
+    }
+
+    return "unknown";
+}
+
+/* ------------------------------
+   LOADERS
+--------------------------------*/
+
+function loadHLS(url) {
+    const video = document.getElementById("videoPlayer");
+    resetPlayer();
+
+    if (Hls.isSupported()) {
+        const hls = new Hls();
+        hls.loadSource(url);
+        hls.attachMedia(video);
+    } else {
+        video.src = url;
+    }
+}
+
+function loadDASH(url) {
+    resetPlayer();
+    dashjs.MediaPlayer().create().initialize(
+        document.getElementById("videoPlayer"),
+        url,
+        true
+    );
+}
+
+function loadFile(url) {
+    resetPlayer();
+    document.getElementById("videoPlayer").src = url;
+}
+
+function loadIframe(url) {
+    const container = document.getElementById("player-container");
+    container.innerHTML = `<iframe src="${url}" allowfullscreen></iframe>`;
+}
+
+async function loadHTML(url) {
+    const html = await fetch(url).then(r => r.text());
+    const links = extractMediaLinks(html, url);
+
+    if (links.length === 0) {
+        alert("No media found in HTML");
+        return;
+    }
+
+    loadMediaFromList(links);
+}
+
+/* ------------------------------
+   PLAYLIST & JSON PARSERS
+--------------------------------*/
+
+async function parseM3U(url) {
+    const text = await fetch(url).then(r => r.text());
+    const lines = text.split("\n");
+    const streams = lines.filter(l => l.startsWith("http"));
+
+    if (streams.length === 0) {
+        alert("No streams found in playlist");
+        return;
+    }
+
+    loadMediaFromList(streams);
+}
+
+async function parseJSON(url) {
+    const json = await fetch(url).then(r => r.json());
+    const urls = JSON.stringify(json).match(/https?:\/\/[^"'\s]+/g) || [];
+
+    if (urls.length === 0) {
+        alert("No media URLs found in JSON");
+        return;
+    }
+
+    loadMediaFromList(urls);
+}
+
+/* ------------------------------
+   HTML PARSER
+--------------------------------*/
+function extractMediaLinks(html, base) {
+    const urls = [];
+
+    const regex = /src=["']([^"']+)["']/g;
+    let match;
+
+    while ((match = regex.exec(html)) !== null) {
+        const full = new URL(match[1], base).href;
+        urls.push(full);
+    }
+
+    return urls;
+}
+
+/* ------------------------------
+   UTILITIES
+--------------------------------*/
+function resetPlayer() {
+    const container = document.getElementById("player-container");
+    container.innerHTML = `<video id="videoPlayer" controls></video>`;
+}
+
+async function loadMediaFromList(list) {
+    const first = list[0];
+    document.getElementById("urlInput").value = first;
+    loadMedia();
+}
+</script>
+
+</body>
+</html>
