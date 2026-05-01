@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Medium</title>
+<style>
+  :root {
+    --bg: #0c0c0c;
+    --surface: #1a1a1a;
+    --text: #e0e0e0;
+    --primary: #bb86fc;
+    --accent: #03dac6;
+    --error: #cf6679;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+  .playlist-panel {
+    width: 320px;
+    background: var(--surface);
+    overflow-y: auto;
+    padding: 8px;
+    border-right: 1px solid #333;
+  }
+  .playlist-item {
+    padding: 8px;
+    margin-bottom: 4px;
+    background: #2c2c2c;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .playlist-item:hover { background: #3a3a3a; }
+  .playlist-item.active { background: var(--primary); color: black; }
+  .player-container {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: black;
+    position: relative;
+  }
+  video, iframe {
+    max-width: 100%;
+    max-height: 100%;
+    width: 100%;
+    height: 100%;
+  }
+  .status {
+    position: absolute;
+    bottom: 16px;
+    right: 16px;
+    background: #000a;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    z-index: 10;
+  }
+  .no-params-message {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: #888;
+    font-size: 16px;
+    text-align: center;
+    padding: 20px;
+  }
+  /* Activation overlay */
+  .activation-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(60, 60, 60, 0.95);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    opacity: 1;
+    transition: opacity 0.5s ease;
+    pointer-events: none;
+  }
+  .activation-text {
+    font-weight: bold;
+    font-size: 2.5rem;
+    color: white;
+    text-shadow: 0 2px 8px rgba(0,0,0,0.6);
+    letter-spacing: 2px;
+  }
+  .activation-overlay.fade-out {
+    opacity: 0;
+  }
+</style>
+</head>
+<body>
+<div class="main">
+  <div class="playlist-panel" id="playlistPanel"></div>
+  <div class="player-container">
+    <div id="playerWrapper" style="width:100%; height:100%;"></div>
+    <div class="status" id="status"></div>
+  </div>
+</div>
+
+<!-- streaming libraries -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+
+<script>
+  // ====================== GLOBAL STATE ========================
+  let currentToken = null;
+  let tokenRefreshTimer = null;
+  let currentStream = null;
+  let hlsInstance = null;
+  let dashInstance = null;
+  let refreshEndpoint = null;
+  let refreshInterval = 3600;
+
+  const playerWrapper = document.getElementById('playerWrapper');
+  const playlistPanel = document.getElementById('playlistPanel');
+  const statusDiv = document.getElementById('status');
+
+  // ====================== ACTIVATION OVERLAY ========================
+  function showActivationMessage() {
+    // Remove any existing overlay
+    const old = document.querySelector('.activation-overlay');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'activation-overlay';
+    overlay.innerHTML = '<span class="activation-text">Medium backend activated</span>';
+    document.querySelector('.player-container').appendChild(overlay);
+
+    // Fade out after 2.5 seconds, remove after fade
+    setTimeout(() => {
+      overlay.classList.add('fade-out');
+      setTimeout(() => overlay.remove(), 600);
+    }, 2500);
+  }
+
+  // ====================== UTILS ========================
+  function updateStatus(text) {
+    statusDiv.textContent = text;
+  }
+
+  function appendToken(url) {
+    if (!currentToken) return url;
+    try {
+      const u = new URL(url);
+      u.searchParams.set('token', currentToken);
+      return u.toString();
+    } catch (e) {
+      const sep = url.includes('?') ? '&' : '?';
+      return `${url}${sep}token=${encodeURIComponent(currentToken)}`;
+    }
+  }
+
+  // ====================== TOKEN REFRESH ========================
+  async function refreshToken() {
+    if (!refreshEndpoint) return currentToken;
+    try {
+      updateStatus('Refreshing token...');
+      const resp = await fetch(refreshEndpoint);
+      if (!resp.ok) throw new Error('Refresh failed');
+      const data = await resp.json();
+      const newToken = data.token || data;
+      if (newToken && newToken !== currentToken) {
+        currentToken = newToken;
+        if (currentStream) reloadCurrentStream();
+      }
+      updateStatus('Token refreshed');
+    } catch (err) {
+      console.error('Token refresh error:', err);
+      updateStatus('Token refresh failed');
+    }
+  }
+
+  function startTokenRefresh() {
+    stopTokenRefresh();
+    if (refreshEndpoint && refreshInterval > 0) {
+      tokenRefreshTimer = setInterval(refreshToken, refreshInterval * 1000);
+    }
+  }
+
+  function stopTokenRefresh() {
+    if (tokenRefreshTimer) {
+      clearInterval(tokenRefreshTimer);
+      tokenRefreshTimer = null;
+    }
+  }
+
+  // ====================== PLAYER LOGIC ========================
+  function clearPlayer() {
+    if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+    if (dashInstance) { dashInstance.reset(); dashInstance = null; }
+    playerWrapper.innerHTML = '';
+    currentStream = null;
+  }
+
+  function reloadCurrentStream() {
+    if (!currentStream) return;
+    playStream(currentStream.originalUrl, currentStream.type);
+  }
+
+  function playStream(originalUrl, type) {
+    clearPlayer();
+    updateStatus(`Loading: ${originalUrl}`);
+
+    const tokenizedUrl = appendToken(originalUrl);
+    currentStream = { originalUrl, type, url: tokenizedUrl };
+
+    // ---- Iframe / embed detection ----
+    if (
+      type === 'iframe' ||
+      originalUrl.includes('youtube.com') ||
+      originalUrl.includes('youtu.be') ||
+      originalUrl.includes('vimeo.com') ||
+      originalUrl.includes('dailymotion.com') ||
+      originalUrl.includes('embed') ||
+      originalUrl.trim().startsWith('<iframe')
+    ) {
+      let iframeSrc = originalUrl;
+      if (originalUrl.trim().startsWith('<iframe')) {
+        const match = originalUrl.match(/src=["']([^"']+)["']/);
+        if (match) iframeSrc = match[1];
+      }
+      const iframe = document.createElement('iframe');
+      iframe.src = iframeSrc;
+      iframe.allowFullscreen = true;
+      iframe.style.width = '100%';
+      iframe.style.height = '100%';
+      iframe.style.border = 'none';
+      playerWrapper.appendChild(iframe);
+      updateStatus('Playing embed/iframe');
+      return;
+    }
+
+    // ---- HLS (m3u8) ----
+    if (type === 'm3u8' || tokenizedUrl.includes('.m3u8')) {
+      if (Hls.isSupported()) {
+        const video = document.createElement('video');
+        video.controls = true;
+        video.style.width = '100%';
+        video.style.height = '100%';
+        playerWrapper.appendChild(video);
+        const hls = new Hls({ loader: Hls.DefaultConfig.loader });
+        hls.config.fetchSetup = (context, initParams) => {
+          const url = new URL(context.url);
+          if (currentToken) url.searchParams.set('token', currentToken);
+          return new Request(url.toString(), initParams);
+        };
+        hls.loadSource(tokenizedUrl);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+        hlsInstance = hls;
+        updateStatus('Playing HLS');
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        const video = document.createElement('video');
+        video.src = tokenizedUrl;
+        video.controls = true;
+        video.style.width = '100%';
+        video.style.height = '100%';
+        playerWrapper.appendChild(video);
+        video.play();
+        updateStatus('Playing HLS (native)');
+      }
+      return;
+    }
+
+    // ---- DASH (mpd) ----
+    if (type === 'mpd' || tokenizedUrl.includes('.mpd')) {
+      const video = document.createElement('video');
+      video.controls = true;
+      video.style.width = '100%';
+      video.style.height = '100%';
+      playerWrapper.appendChild(video);
+      const player = dashjs.MediaPlayer().create();
+      player.initialize(video, tokenizedUrl, true);
+      player.extend("RequestModifier", () => {
+        return {
+          modifyRequestURL: (url) => {
+            if (currentToken) {
+              const u = new URL(url);
+              u.searchParams.set('token', currentToken);
+              return u.toString();
+            }
+            return url;
+          }
+        };
+      }, true);
+      dashInstance = player;
+      updateStatus('Playing DASH');
+      return;
+    }
+
+    // ---- Direct video (mp4, webm, etc.) ----
+    const video = document.createElement('video');
+    video.src = tokenizedUrl;
+    video.controls = true;
+    video.style.width = '100%';
+    video.style.height = '100%';
+    playerWrapper.appendChild(video);
+    video.play().catch(e => updateStatus('Playback error: ' + e.message));
+    updateStatus('Playing direct video');
+  }
+
+  // ====================== PLAYLIST PARSING ========================
+  function parseM3U(text) {
+    const lines = text.split(/\r?\n/);
+    const items = [];
+    let currentName = '';
+    let currentAttrs = {};
+    for (const line of lines) {
+      if (line.startsWith('#EXTINF:')) {
+        const infoPart = line.substring(8);
+        const commaIndex = infoPart.lastIndexOf(',');
+        if (commaIndex >= 0) {
+          currentName = infoPart.substring(commaIndex + 1).trim();
+          currentAttrs = {};
+          const regex = /([\w-]+)="([^"]*)"/g;
+          let m;
+          while ((m = regex.exec(infoPart.substring(0, commaIndex))) !== null) {
+            currentAttrs[m[1]] = m[2];
+          }
+        }
+      } else if (line.trim() && !line.startsWith('#')) {
+        items.push({
+          name: currentName || line.trim(),
+          url: line.trim(),
+          logo: currentAttrs['tvg-logo'] || null,
+          group: currentAttrs['group-title'] || 'Uncategorized',
+          type: line.includes('.m3u8') ? 'm3u8' : 
+                line.includes('.mpd') ? 'mpd' : 
+                line.includes('.mp4') ? 'mp4' : 'unknown'
+        });
+        currentName = '';
+        currentAttrs = {};
+      }
+    }
+    return items;
+  }
+
+  function parseJSONPlaylist(json) {
+    if (Array.isArray(json)) return json;
+    if (json.channels) return json.channels;
+    if (json.items) return json.items;
+    return [];
+  }
+
+  function renderPlaylist(items) {
+    playlistPanel.innerHTML = '';
+    if (!items.length) {
+      playlistPanel.innerHTML = '<p style="padding:10px;">No items found.</p>';
+      return;
+    }
+    for (const item of items) {
+      const div = document.createElement('div');
+      div.className = 'playlist-item';
+      div.innerHTML = `<strong>${item.name}</strong><br><small>${item.group || 'No group'}</small>`;
+      if (item.logo) {
+        const img = document.createElement('img');
+        img.src = item.logo;
+        img.style.height = '20px';
+        img.style.marginLeft = '8px';
+        img.style.verticalAlign = 'middle';
+        div.prepend(img);
+      }
+      div.addEventListener('click', () => {
+        document.querySelectorAll('.playlist-item').forEach(el => el.classList.remove('active'));
+        div.classList.add('active');
+        playStream(item.url, item.type || 'unknown');
+      });
+      playlistPanel.appendChild(div);
+    }
+    updateStatus(`Loaded ${items.length} items`);
+  }
+
+  async function loadPlaylist(url) {
+    const tokenizedUrl = appendToken(url);
+    try {
+      updateStatus('Fetching playlist...');
+      const resp = await fetch(tokenizedUrl);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const contentType = resp.headers.get('content-type') || '';
+      const text = await resp.text();
+
+      let items;
+      if (contentType.includes('json') || url.endsWith('.json')) {
+        items = parseJSONPlaylist(JSON.parse(text));
+      } else {
+        items = parseM3U(text);
+      }
+      renderPlaylist(items);
+      if (items.length === 1) {
+        playStream(items[0].url, items[0].type);
+        document.querySelector('.playlist-item')?.classList.add('active');
+      }
+    } catch (err) {
+      updateStatus('Error loading playlist: ' + err.message);
+      console.error(err);
+    }
+  }
+
+  function autoStart(url) {
+    if (url.endsWith('.m3u') || url.endsWith('.m3u8') || url.endsWith('.json')) {
+      loadPlaylist(url);
+    } else {
+      let type = 'unknown';
+      if (url.includes('.m3u8')) type = 'm3u8';
+      else if (url.includes('.mpd')) type = 'mpd';
+      else if (url.includes('youtube') || url.includes('embed')) type = 'iframe';
+      playStream(url, type);
+    }
+    // Show activation message after auto-start is triggered
+    showActivationMessage();
+  }
+
+  function applyURLParams() {
+    const params = new URLSearchParams(window.location.search);
+    const src = params.get('src');
+    const token = params.get('token');
+    const refresh = params.get('refresh');
+    const interval = params.get('interval');
+
+    if (token) {
+      currentToken = token;
+    }
+    if (refresh) {
+      refreshEndpoint = refresh;
+      if (interval) refreshInterval = parseInt(interval, 10);
+      startTokenRefresh();
+    }
+
+    if (src) {
+      autoStart(src);
+    } else {
+      playerWrapper.innerHTML = '<div class="no-params-message">Medium — append ?src=playlist_url&token=...&refresh=...&interval=...</div>';
+    }
+  }
+
+  window.addEventListener('load', applyURLParams);
+</script>
+</body>
+</html>
